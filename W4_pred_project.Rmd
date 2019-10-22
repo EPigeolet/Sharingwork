@@ -1,0 +1,195 @@
+---
+title: "Graded peer review Coursera Practical ML"
+author: "Etienne Pigeolet"
+date: "10/22/2019"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+## Check of the data
+
+Clean up and upload of the needed packages, training and test datasets
+```{r message = FALSE, warning = FALSE }
+remove(list=ls())
+library (dplyr)
+library(ggplot2)
+library(caret)
+library(e1071)
+library(nnet)
+data<- read.csv("pml-training.csv",header=T)
+datQ<- read.csv("pml-testing.csv",header=T)
+```
+Inspecting the datasets, it is obvious many columns are not needed for the analysis, so droppping them to
+make the datasets simpler
+```{r}
+dat2<-select(data, -starts_with("kurtos"))
+dat2<-select(dat2, -starts_with("skewn"))
+dat2<-select(dat2, -starts_with("max"))
+dat2<-select(dat2, -starts_with("min"))
+dat2<-select(dat2, -starts_with("amplit"))
+dat2<-select(dat2, -starts_with("var_"))
+dat2<-select(dat2, -starts_with("avg_"))
+dat2<-select(dat2, -starts_with("stddev_"))
+dat2<-select(dat2, -starts_with("x"))
+dat2<-select(dat2, -starts_with("cvtd_"))
+dat2<-select(dat2, -starts_with("new_win"))
+```
+Now, check if there are highly correlated variables, which could be dropped
+```{r}
+cormat<-cor(dat2[,-c(1,57)])
+cormat[cormat==1]<-0
+which(cormat>0.90,arr.ind=T )
+which(cormat< -0.90,arr.ind=T )
+```
+ and delete columns with corr coeff > abs 0.9
+```{r}
+dat2<-select(dat2, -starts_with("total_accel_belt"))
+dat2<-select(dat2, -starts_with("roll_belt"))
+dat2<-select(dat2, -starts_with("pitch_belt"))
+dat2<-select(dat2, -starts_with("gyros_dumbbell_z"))
+dat2<-select(dat2, -starts_with("accel_belt_z"))
+dat2<-select(dat2, -starts_with("gyros_arm_y"))
+dat2<-select(dat2, -starts_with("gyros_forearm_z"))
+```
+ and check remaining variables have no more than abs 0.9 corr coeff
+```{r}
+cormat<-cor(dat2[,-c(1,50)])
+cormat[cormat==1]<-0
+which(cormat>0.90,arr.ind=T )
+which(cormat< -0.90,arr.ind=T )
+```
+split then the datset into training and testing
+```{r}
+set.seed(1234)
+inTrain = createDataPartition(dat2$classe, p = 3/4)[[1]]
+training = dat2[ inTrain,]
+testing = dat2[-inTrain,]
+```
+check the distribution of data for skewness and kurotsis to assess need for normalization
+```{r}
+skew<- apply(training[,c(-1,-50)],2,skewness)
+kurt<- apply(training[,c(-1,-50)],2,kurtosis)
+length(which(skew> 1|skew< -1|kurt >2|kurt< -2))
+which(kurt>2|kurt< -2) 
+which(skew> 1|skew< -1)
+```
+indicating that 14 variables over 48 (30%) are highly skewed or ill-tailed => need transformation
+
+## Data pre-processing
+First use box cox transformation of all numeric variables
+```{r}
+preObj <-preProcess(training[,c(-1,-50)],method=c("BoxCox"))
+trainS <-predict(preObj,training[,c(-1,-50)])
+```
+And then Principal Component Analysis on transformed data to reduce the number of variables
+```{r}
+preProc <-preProcess(trainS,method="pca",thresh = 0.8)
+preProc$numComp 
+trainPC<- predict(preProc,trainS)
+```
+seems reasonably well shrunk from 48 variables to 14, trainPC created with PCA results
+
+the user name and classe variables are added back to these datasets
+```{r}
+
+trainS$user <-training$user_name
+trainS$classe <-training$classe
+trainPC$user <-training$user_name
+trainPC$classe <-training$classe
+```
+
+## Regression and Classification methods on the transformed training dataset 
+### General Linear Model
+Try first a logistic regression. The response is multinomial, so we cannot use the glm method, need to use nnet package
+```{r message = FALSE, warning = FALSE }
+mmodel <- multinom(classe ~ .,data=trainPC)
+pred.classe <-predict(mmodel,trainPC)
+confM <- confusionMatrix(training$classe,pred.classe)
+confM$overall 
+```
+The accuracy is only 52%; this is too low to hope prediciting the test dataset accurately
+
+### Random Forest
+The following code was used:
+ **modFit <- train(classe~.,data=trainPC,method="rf",prox=TRUE)** 
+but with this dataset, ran for more than 90 min without converging and then was stopped
+
+### Lasso
+```{r message = FALSE, warning = FALSE }
+library(glmnet)
+```
+Define Predictor and Outcome variables
+```{r}
+x <- model.matrix(classe~., trainPC)[,-1]
+y <- trainPC$classe
+```
+Find the best lambda using the glmnet cross-validation function,  fit the model with the best lambda and 
+predict response on the training data
+```{r}
+cv <- cv.glmnet(x, y, family="multinomial",alpha = 1)
+modFit <- glmnet(x, y, family="multinomial",alpha = 1, lambda = cv$lambda.min)
+preds2<- data.frame(predict(modFit,x,type="response"))
+```
+preds2 gives a probability for the different classes for each row, so to assess predictions
+against actual classes in training set, pick the class with the highest probability in each row
+```{r}
+preds3<-0
+for(i in (rownames(preds2)))
+{
+  preds3[i]<-as.vector(which.max(preds2[i,]))
+}
+preds3<-preds3[-1]
+preds3[preds3==1]<- "A"
+preds3[preds3==2]<- "B"
+preds3[preds3==3]<- "C"
+preds3[preds3==4]<- "D"
+preds3[preds3==5]<- "E"
+preds3<-as.factor(preds3)
+unique(preds3)
+```
+we can check now how good model predicts outcome vs actual in training data
+```{r}
+confM2<-confusionMatrix(y,preds3) 
+confM2$overall
+```
+Like for logistic regression, not a very good accuracy
+
+### Support Vector Machine
+Fit a SVM model and compute the predictions on the training data
+```{r}
+model_svm <- svm(classe ~ . , trainPC)
+preds4 <- predict(model_svm, trainPC)
+```
+ and check how good model predict outcome vs actual in training data
+```{r}
+confM3<- confusionMatrix(y,preds4) 
+confM3$overall
+```
+We now have a quite good accuracy of 86% and can check how good model predict outcome in testing data
+
+First need to pre-process the data as done with training data
+```{r}
+preObj <-preProcess(testing[,c(-1,-50)],method=c("BoxCox"))
+testS <-predict(preObj,testing[,c(-1,-50)])
+```
+and predict Principal Component variables from the training model
+```{r}
+testPC<- predict(preProc,testS)
+```
+add back the user name and classe variables and predict the test data with SVM model
+```{r}
+testPC$user <-testing$user_name
+testPC$classe <-testing$classe
+preds.svm <- predict(model_svm, testPC)
+```
+finally check the accuracy on test data
+```{r}
+confM3 <-confusionMatrix(testing$classe,preds.svm)
+confM3$overall
+```
+The accuracy remains very good and the out of sample error is expected to be 15%, 
+so for the quizz where 20% error is tolerated to pass, this should be ok (and it was indeed).
+
+Thanks for reviewing this - hope it is clear and light !
